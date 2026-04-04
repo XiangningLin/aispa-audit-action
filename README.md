@@ -1,11 +1,11 @@
-# APAS Audit Action
+# AISPA Audit Action
 
-A GitHub Action for auditing AI system prompts against the **APAS (AI Prompt Assurance Standard)** — like Snyk for security, but for LLM system prompt ethics.
+A GitHub Action for auditing AI system prompts against the **AISPA (AI System Prompt Auditing)** standard — like Snyk for security, but for LLM system prompt ethics.
 
 ## Usage
 
 ```yaml
-name: APAS Prompt Audit
+name: AISPA Prompt Audit
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: XiangningLin/apas-audit-action@v1
+      - uses: XiangningLin/aispa-audit-action@v1
         with:
           prompts-dir: ./prompts
           threshold: 70
@@ -32,11 +32,11 @@ jobs:
 |-------|----------|---------|-------------|
 | `prompts-dir` | Yes | `./prompts` | Path to directory containing prompt files |
 | `threshold` | No | `0` | Minimum compliance rate (0-100) |
-| `api-url` | No | Production URL | APAS service base URL |
+| `api-url` | No | Production URL | AISPA service base URL |
 | `api-key` | No | - | API key for authentication |
 | `model` | No | - | LLM model for auditing |
 | `output-format` | No | `table` | Output format: `table` or `json` |
-| `version` | No | `latest` | apas-audit CLI version |
+| `version` | No | `latest` | aispa-audit CLI version |
 
 ## Outputs
 
@@ -48,13 +48,13 @@ jobs:
 ## How It Works
 
 1. Sets up Python 3.12
-2. Installs `apas-audit` CLI from PyPI
+2. Installs `aispa-audit` CLI from PyPI
 3. Scans all prompt files (`.txt`, `.md`, `.prompt`, `.system`) in the specified directory
-4. Calls the APAS auditing API for each prompt
+4. Calls the AISPA auditing API for each prompt
 5. Evaluates results against the threshold
 6. Fails the CI check if any prompt doesn't meet the standard
 
-## APAS Dimensions
+## AISPA Dimensions
 
 Each prompt is evaluated across 8 ethical dimensions:
 

@@ -1,5 +1,5 @@
-name: "APAS Audit"
-description: "Audit AI system prompts against the APAS (AI Prompt Assurance Standard) in your CI/CD pipeline"
+name: "AISPA Audit"
+description: "Audit AI system prompts against the AISPA (AI System Prompt Auditing) standard in your CI/CD pipeline"
 author: "Xiangning Lin"
 
 branding:
@@ -16,11 +16,11 @@ inputs:
     required: false
     default: "0"
   api-url:
-    description: "Base URL of the APAS auditing service"
+    description: "Base URL of the AISPA auditing service"
     required: false
     default: "https://prompt-auditing-service.vercel.app"
   api-key:
-    description: "API key for the APAS service"
+    description: "API key for the AISPA service"
     required: false
   model:
     description: "LLM model to use for auditing"
@@ -30,7 +30,7 @@ inputs:
     required: false
     default: "table"
   version:
-    description: "Version of apas-audit CLI to install"
+    description: "Version of aispa-audit CLI to install"
     required: false
     default: "latest"
 
@@ -50,22 +50,22 @@ runs:
       with:
         python-version: "3.12"
 
-    - name: Install apas-audit
+    - name: Install aispa-audit
       shell: bash
       run: |
         if [ "${{ inputs.version }}" = "latest" ]; then
-          pip install apas-audit
+          pip install aispa-audit
         else
-          pip install "apas-audit==${{ inputs.version }}"
+          pip install "aispa-audit==${{ inputs.version }}"
         fi
 
-    - name: Run APAS audit
+    - name: Run AISPA audit
       id: audit
       shell: bash
       env:
-        APAS_API_URL: ${{ inputs.api-url }}
-        APAS_API_KEY: ${{ inputs.api-key }}
-        APAS_MODEL: ${{ inputs.model }}
+        AISPA_API_URL: ${{ inputs.api-url }}
+        AISPA_API_KEY: ${{ inputs.api-key }}
+        AISPA_MODEL: ${{ inputs.model }}
       run: |
         set +e
 
@@ -74,13 +74,13 @@ runs:
         ARGS="$ARGS --output ${{ inputs.output-format }}"
 
         if [ "${{ inputs.output-format }}" = "json" ]; then
-          RESULT=$(apas-audit $ARGS 2>&1)
+          RESULT=$(aispa-audit $ARGS 2>&1)
           EXIT_CODE=$?
           echo "result<<EOF" >> $GITHUB_OUTPUT
           echo "$RESULT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
         else
-          apas-audit $ARGS
+          aispa-audit $ARGS
           EXIT_CODE=$?
         fi
 
