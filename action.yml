@@ -54,7 +54,7 @@ runs:
       shell: bash
       run: |
         if [ "${{ inputs.version }}" = "latest" ]; then
-          pip install aispa-audit
+          pip install "aispa-audit @ git+https://github.com/XiangningLin/aispa-audit.git@main"
         else
           pip install "aispa-audit==${{ inputs.version }}"
         fi
