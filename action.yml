@@ -35,12 +35,6 @@ inputs:
     default: "latest"
 
 outputs:
-  result:
-    description: "JSON audit result"
-    value: ${{ steps.audit.outputs.result }}
-  report-markdown:
-    description: "Markdown-formatted audit report"
-    value: ${{ steps.audit.outputs.report_markdown }}
   status:
     description: "Overall status: PASSED or FAILED"
     value: ${{ steps.audit.outputs.status }}
@@ -76,17 +70,11 @@ runs:
         aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output table
         EXIT_CODE=$?
 
-        # Generate markdown report
-        MARKDOWN=$(aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output markdown 2>&1 || true)
-        echo "report_markdown<<AISPA_EOF" >> $GITHUB_OUTPUT
-        echo "$MARKDOWN" >> $GITHUB_OUTPUT
-        echo "AISPA_EOF" >> $GITHUB_OUTPUT
+        # Write markdown report to file (avoids shell/JS injection issues)
+        aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output markdown > /tmp/aispa-report.md 2>&1 || true
 
-        # Generate JSON result
-        JSON_RESULT=$(aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output json 2>&1 || true)
-        echo "result<<AISPA_JSON_EOF" >> $GITHUB_OUTPUT
-        echo "$JSON_RESULT" >> $GITHUB_OUTPUT
-        echo "AISPA_JSON_EOF" >> $GITHUB_OUTPUT
+        # Write JSON result to file
+        aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output json > /tmp/aispa-result.json 2>&1 || true
 
         if [ $EXIT_CODE -eq 0 ]; then
           echo "status=PASSED" >> $GITHUB_OUTPUT
@@ -101,10 +89,16 @@ runs:
       uses: actions/github-script@v7
       with:
         script: |
+          const fs = require('fs');
           const marker = '<!-- aispa-audit-report -->';
-          const body = marker + '\n' + `${{ steps.audit.outputs.report_markdown }}`;
+          let reportContent = '';
+          try {
+            reportContent = fs.readFileSync('/tmp/aispa-report.md', 'utf8').trim();
+          } catch (e) {
+            reportContent = '⚠️ AISPA audit report could not be generated. Check the workflow logs.';
+          }
+          const body = marker + '\n' + reportContent;
 
-          // Find existing AISPA comment to update (avoid spam)
           const { data: comments } = await github.rest.issues.listComments({
             owner: context.repo.owner,
             repo: context.repo.repo,
