@@ -25,10 +25,10 @@ inputs:
   model:
     description: "LLM model to use for auditing"
     required: false
-  output-format:
-    description: "Output format: table or json"
+  comment-on-pr:
+    description: "Post audit results as a PR comment (requires pull_request trigger)"
     required: false
-    default: "table"
+    default: "true"
   version:
     description: "Version of aispa-audit CLI to install"
     required: false
@@ -38,6 +38,9 @@ outputs:
   result:
     description: "JSON audit result"
     value: ${{ steps.audit.outputs.result }}
+  report-markdown:
+    description: "Markdown-formatted audit report"
+    value: ${{ steps.audit.outputs.report_markdown }}
   status:
     description: "Overall status: PASSED or FAILED"
     value: ${{ steps.audit.outputs.status }}
@@ -69,20 +72,21 @@ runs:
       run: |
         set +e
 
-        ARGS="${{ inputs.prompts-dir }}"
-        ARGS="$ARGS --threshold ${{ inputs.threshold }}"
-        ARGS="$ARGS --output ${{ inputs.output-format }}"
+        # Run with table output for logs
+        aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output table
+        EXIT_CODE=$?
 
-        if [ "${{ inputs.output-format }}" = "json" ]; then
-          RESULT=$(aispa-audit $ARGS 2>&1)
-          EXIT_CODE=$?
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-        else
-          aispa-audit $ARGS
-          EXIT_CODE=$?
-        fi
+        # Generate markdown report
+        MARKDOWN=$(aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output markdown 2>&1 || true)
+        echo "report_markdown<<AISPA_EOF" >> $GITHUB_OUTPUT
+        echo "$MARKDOWN" >> $GITHUB_OUTPUT
+        echo "AISPA_EOF" >> $GITHUB_OUTPUT
+
+        # Generate JSON result
+        JSON_RESULT=$(aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output json 2>&1 || true)
+        echo "result<<AISPA_JSON_EOF" >> $GITHUB_OUTPUT
+        echo "$JSON_RESULT" >> $GITHUB_OUTPUT
+        echo "AISPA_JSON_EOF" >> $GITHUB_OUTPUT
 
         if [ $EXIT_CODE -eq 0 ]; then
           echo "status=PASSED" >> $GITHUB_OUTPUT
@@ -91,3 +95,35 @@ runs:
         fi
 
         exit $EXIT_CODE
+
+    - name: Comment on PR
+      if: always() && github.event_name == 'pull_request' && inputs.comment-on-pr == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const marker = '<!-- aispa-audit-report -->';
+          const body = marker + '\n' + `${{ steps.audit.outputs.report_markdown }}`;
+
+          // Find existing AISPA comment to update (avoid spam)
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+          const existing = comments.find(c => c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body: body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body,
+            });
+          }
