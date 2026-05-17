@@ -7,10 +7,14 @@ branding:
   color: "blue"
 
 inputs:
+  config-file:
+    description: "Path to .aispa.yml config file. If not set, looks for .aispa.yml in repo root."
+    required: false
+    default: ".aispa.yml"
   prompts-dir:
-    description: "Comma-separated paths to directories containing system prompt files"
-    required: true
-    default: "./prompts"
+    description: "Path to directory containing prompt files (fallback if no .aispa.yml exists)"
+    required: false
+    default: ""
   threshold:
     description: "Minimum compliance rate (0-100) to pass the audit"
     required: false
@@ -32,7 +36,7 @@ inputs:
 
 outputs:
   status:
-    description: "Overall status: PASSED or FAILED"
+    description: "Overall status: PASSED, FAILED, or SKIPPED"
     value: ${{ steps.audit.outputs.status }}
 
 runs:
@@ -45,56 +49,301 @@ runs:
         AISPA_API_URL: ${{ inputs.api-url }}
         AISPA_API_KEY: ${{ inputs.api-key }}
         AISPA_MODEL: ${{ inputs.model }}
-        PROMPTS_DIR: ${{ inputs.prompts-dir }}
+        AISPA_CONFIG_FILE: ${{ inputs.config-file }}
+        AISPA_PROMPTS_DIR: ${{ inputs.prompts-dir }}
         THRESHOLD: ${{ inputs.threshold }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: |
         python3 << 'PYTHON_SCRIPT'
-        import os, json, sys, urllib.request, urllib.error
+        import os, json, sys, re, ast, glob, subprocess, urllib.request, urllib.error
         from pathlib import Path
 
+        # ---------------------------------------------------------------------------
+        # Config
+        # ---------------------------------------------------------------------------
         api_url = os.environ.get("AISPA_API_URL", "https://systempromptauditingbackend.vercel.app")
         api_key = os.environ.get("AISPA_API_KEY", "")
         model = os.environ.get("AISPA_MODEL", "")
-        prompts_dirs = os.environ.get("PROMPTS_DIR", "./prompts")
+        config_file = os.environ.get("AISPA_CONFIG_FILE", ".aispa.yml")
+        prompts_dir = os.environ.get("AISPA_PROMPTS_DIR", "")
         threshold = int(os.environ.get("THRESHOLD", "0"))
+        event_name = os.environ.get("GITHUB_EVENT_NAME", "")
 
-        EXTENSIONS = {".txt", ".md", ".prompt", ".system"}
+        PROMPT_FILE_EXTENSIONS = {".txt", ".md", ".prompt", ".system"}
 
-        # Discover prompt files from all directories (comma-separated)
-        dirs = [d.strip() for d in prompts_dirs.split(",") if d.strip()]
-        files = []
-        for d in dirs:
-            root = Path(d)
+        # ---------------------------------------------------------------------------
+        # Parse .aispa.yml
+        # ---------------------------------------------------------------------------
+        def load_config(path):
+            """Load .aispa.yml config file. Returns list of source dicts."""
+            import importlib
+            try:
+                yaml = importlib.import_module("yaml")
+            except ImportError:
+                # PyYAML not available — parse simple YAML manually
+                return parse_simple_yaml(path)
+
+            with open(path) as f:
+                cfg = yaml.safe_load(f)
+            return cfg.get("sources", [])
+
+        def parse_simple_yaml(path):
+            """Minimal YAML parser for .aispa.yml (handles our specific format)."""
+            sources = []
+            current = None
+            current_list = None
+
+            with open(path) as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if stripped == "sources:":
+                        continue
+                    if stripped.startswith("- path:"):
+                        if current:
+                            sources.append(current)
+                        current = {"path": stripped.split(":", 1)[1].strip().strip('"').strip("'")}
+                        current_list = None
+                        continue
+                    if current is not None:
+                        if stripped.startswith("type:"):
+                            current["type"] = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                            current_list = None
+                        elif stripped.startswith("fields:"):
+                            rest = stripped.split(":", 1)[1].strip()
+                            if rest.startswith("["):
+                                items = rest.strip("[]").split(",")
+                                current["fields"] = [i.strip().strip('"').strip("'") for i in items if i.strip()]
+                            else:
+                                current["fields"] = []
+                                current_list = "fields"
+                        elif stripped.startswith("pattern:"):
+                            current["pattern"] = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                        elif current_list and stripped.startswith("- "):
+                            current[current_list].append(stripped[2:].strip().strip('"').strip("'"))
+
+            if current:
+                sources.append(current)
+            return sources
+
+        # ---------------------------------------------------------------------------
+        # Prompt extractors
+        # ---------------------------------------------------------------------------
+        def extract_from_directory(source):
+            """Extract prompts from a directory of prompt files."""
+            prompts = []
+            root = Path(source["path"])
             if not root.is_dir():
-                print(f"::warning::Directory not found: {d}, skipping")
-                continue
-            found = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTENSIONS)
-            files.extend(found)
+                print(f"::warning::Directory not found: {source['path']}, skipping")
+                return prompts
+            for p in sorted(root.rglob("*")):
+                if p.is_file() and p.suffix.lower() in PROMPT_FILE_EXTENSIONS:
+                    content = p.read_text(encoding="utf-8").strip()
+                    if content:
+                        prompts.append({"path": str(p), "content": content, "name": p.stem})
+            return prompts
 
-        if not files:
-            print(f"::error::No prompt files found in: {prompts_dirs}")
-            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                f.write("status=FAILED\n")
-            sys.exit(1)
+        def extract_python_constants(source):
+            """Extract string constants that look like prompts from Python files."""
+            prompts = []
+            paths = glob.glob(source["path"], recursive=True)
+            pattern = source.get("pattern", r"(?:PROMPT|TEMPLATE|INSTRUCTION|SYSTEM)")
 
-        print(f"\nAISPA Audit — scanning: {', '.join(dirs)}")
-        print(f"Found {len(files)} prompt file(s)")
-        print("=" * 60)
+            for filepath in sorted(paths):
+                p = Path(filepath)
+                if not p.is_file() or p.suffix != ".py":
+                    continue
+                try:
+                    code = p.read_text(encoding="utf-8")
+                    tree = ast.parse(code)
+                except (SyntaxError, UnicodeDecodeError):
+                    print(f"::warning::Could not parse {filepath}, skipping")
+                    continue
 
-        results = []
-        passed = 0
-        failed = 0
-        errors = 0
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Assign):
+                        continue
+                    for target in node.targets:
+                        if not isinstance(target, ast.Name):
+                            continue
+                        var_name = target.id
+                        if not re.search(pattern, var_name, re.IGNORECASE):
+                            continue
+                        value = _extract_string_value(node.value)
+                        if value and len(value.strip()) > 20:
+                            prompts.append({
+                                "path": f"{filepath}::{var_name}",
+                                "content": value.strip(),
+                                "name": var_name,
+                            })
+            return prompts
 
-        for filepath in files:
-            content = filepath.read_text(encoding="utf-8").strip()
-            if not content:
-                errors += 1
-                results.append({"path": str(filepath), "status": "ERROR", "error": "Empty file"})
-                print(f"  ⚠️  {filepath} — ERROR (empty file)")
-                continue
+        def _extract_string_value(node):
+            """Extract string value from an AST node (handles str, JoinedStr, concatenation)."""
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return node.value
+            if isinstance(node, ast.JoinedStr):
+                parts = []
+                for v in node.values:
+                    if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                        parts.append(v.value)
+                    else:
+                        parts.append("{...}")
+                return "".join(parts)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left = _extract_string_value(node.left)
+                right = _extract_string_value(node.right)
+                if left and right:
+                    return left + right
+            if isinstance(node, ast.Call):
+                # Handle str(...) or "...".format(...)
+                if hasattr(node, 'args') and node.args:
+                    return _extract_string_value(node.args[0])
+            return None
 
-            # Call AISPA API
+        def extract_json_fields(source):
+            """Extract specific fields from JSON files."""
+            prompts = []
+            paths = glob.glob(source["path"], recursive=True)
+            fields = source.get("fields", [])
+
+            for filepath in sorted(paths):
+                p = Path(filepath)
+                if not p.is_file():
+                    continue
+                try:
+                    with open(filepath) as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    print(f"::warning::Could not parse {filepath}, skipping")
+                    continue
+
+                if fields:
+                    for field in fields:
+                        value = data.get(field, "")
+                        if isinstance(value, str) and len(value.strip()) > 20:
+                            prompts.append({
+                                "path": f"{filepath}::{field}",
+                                "content": value.strip(),
+                                "name": f"{p.stem}.{field}",
+                            })
+                else:
+                    _extract_json_strings(data, filepath, p.stem, prompts)
+            return prompts
+
+        def _extract_json_strings(obj, filepath, prefix, prompts):
+            """Recursively find string values in JSON that look like prompts."""
+            prompt_keywords = re.compile(r"(prompt|instruction|system|template)", re.IGNORECASE)
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, str) and len(v.strip()) > 20 and prompt_keywords.search(k):
+                        prompts.append({
+                            "path": f"{filepath}::{k}",
+                            "content": v.strip(),
+                            "name": f"{prefix}.{k}",
+                        })
+                    elif isinstance(v, (dict, list)):
+                        _extract_json_strings(v, filepath, f"{prefix}.{k}", prompts)
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    _extract_json_strings(item, filepath, f"{prefix}[{i}]", prompts)
+
+        def extract_yaml_fields(source):
+            """Extract specific fields from YAML files."""
+            prompts = []
+            paths = glob.glob(source["path"], recursive=True)
+            fields = source.get("fields", [])
+
+            try:
+                import importlib
+                yaml = importlib.import_module("yaml")
+            except ImportError:
+                print("::warning::PyYAML not available, skipping YAML extraction")
+                return prompts
+
+            for filepath in sorted(paths):
+                p = Path(filepath)
+                if not p.is_file():
+                    continue
+                try:
+                    with open(filepath) as f:
+                        data = yaml.safe_load(f)
+                except Exception:
+                    print(f"::warning::Could not parse {filepath}, skipping")
+                    continue
+
+                if not isinstance(data, dict):
+                    continue
+
+                if fields:
+                    for field in fields:
+                        value = data.get(field, "")
+                        if isinstance(value, str) and len(value.strip()) > 20:
+                            prompts.append({
+                                "path": f"{filepath}::{field}",
+                                "content": value.strip(),
+                                "name": f"{p.stem}.{field}",
+                            })
+                else:
+                    _extract_json_strings(data, filepath, p.stem, prompts)
+            return prompts
+
+        EXTRACTORS = {
+            "directory": extract_from_directory,
+            "python-constants": extract_python_constants,
+            "json-field": extract_json_fields,
+            "yaml-field": extract_yaml_fields,
+        }
+
+        # ---------------------------------------------------------------------------
+        # Git diff for incremental scanning
+        # ---------------------------------------------------------------------------
+        def get_changed_files():
+            """Get list of files changed in the current PR."""
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", "origin/main...HEAD"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    return set(result.stdout.strip().split("\n"))
+            except Exception:
+                pass
+
+            try:
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", "HEAD~1"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    return set(result.stdout.strip().split("\n"))
+            except Exception:
+                pass
+
+            return None
+
+        def source_matches_changed_files(source, changed_files):
+            """Check if a source's path matches any changed file."""
+            pattern = source["path"]
+            matched_paths = glob.glob(pattern, recursive=True)
+            for mp in matched_paths:
+                norm = os.path.normpath(mp)
+                for cf in changed_files:
+                    if os.path.normpath(cf) == norm or norm.endswith(cf) or cf.endswith(norm):
+                        return True
+            if source.get("type") == "directory":
+                dir_path = os.path.normpath(source["path"])
+                for cf in changed_files:
+                    if os.path.normpath(cf).startswith(dir_path):
+                        return True
+            return False
+
+        # ---------------------------------------------------------------------------
+        # AISPA API call
+        # ---------------------------------------------------------------------------
+        def audit_prompt(content):
+            """Call the AISPA API to audit a single prompt."""
             payload = {"prompt": content, "consent": True}
             if model:
                 payload["model"] = model
@@ -109,115 +358,219 @@ runs:
                 headers=headers,
                 method="POST",
             )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode())
 
-            try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    data = json.loads(resp.read().decode())
-            except (urllib.error.URLError, urllib.error.HTTPError) as e:
-                errors += 1
-                err_msg = str(e)
-                results.append({"path": str(filepath), "status": "ERROR", "error": err_msg})
-                print(f"  ⚠️  {filepath} — ERROR ({err_msg})")
-                continue
+        # ---------------------------------------------------------------------------
+        # Main
+        # ---------------------------------------------------------------------------
+        def main():
+            # 1. Load sources configuration
+            sources = []
+            config_path = Path(config_file)
 
-            compliance_rate = data.get("compliance_rate", 0)
-            status = data.get("overall_status", "FAIL")
-            if threshold and compliance_rate < threshold:
-                status = "FAIL"
-
-            if status == "PASS":
-                passed += 1
-                print(f"  ✅ {filepath} — PASS (compliance: {compliance_rate}%, score: {data.get('overall_score', 0)})")
+            if config_path.is_file():
+                print(f"Loading config from {config_file}")
+                sources = load_config(str(config_path))
+            elif prompts_dir:
+                print(f"No {config_file} found, using prompts-dir: {prompts_dir}")
+                for d in prompts_dir.split(","):
+                    d = d.strip()
+                    if d:
+                        sources.append({"path": d, "type": "directory"})
             else:
-                failed += 1
-                print(f"  ❌ {filepath} — FAIL (compliance: {compliance_rate}%, score: {data.get('overall_score', 0)})")
-                for issue in data.get("critical_issues", []):
-                    print(f"       • {issue}")
+                print(f"::error::No {config_file} found and no prompts-dir specified. "
+                      f"Create a .aispa.yml in your repo root to configure prompt sources.")
+                with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                    f.write("status=FAILED\n")
+                sys.exit(1)
 
-            results.append({
-                "path": str(filepath),
-                "status": status,
-                "compliance_rate": compliance_rate,
-                "overall_score": data.get("overall_score", 0),
-                "dimensions": data.get("dimensions", []),
-                "critical_issues": data.get("critical_issues", []),
-                "recommendations": data.get("recommendations", []),
-            })
+            print(f"Configured {len(sources)} source(s)")
+            for s in sources:
+                print(f"  - [{s.get('type', 'directory')}] {s['path']}")
 
-        total = len(files)
-        overall_pass = failed == 0 and errors == 0
+            # 2. For PR events, determine which sources have changed files
+            is_pr = event_name == "pull_request"
+            sources_to_scan = sources
 
-        print(f"\n{'=' * 60}")
-        print(f"Summary: {total} prompt(s) scanned, {passed} passed, {failed} failed, {errors} error(s)")
-        print(f"\n{'✅ PASSED' if overall_pass else '❌ FAILED'}\n")
+            if is_pr:
+                changed_files = get_changed_files()
+                if changed_files is not None:
+                    sources_to_scan = [
+                        s for s in sources
+                        if source_matches_changed_files(s, changed_files)
+                    ]
+                    if not sources_to_scan:
+                        print("\nNo prompt files were modified in this PR. Skipping audit.")
+                        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                            f.write("status=SKIPPED\n")
 
-        # Generate markdown report
-        icon = "✅" if overall_pass else "❌"
-        md = []
-        md.append(f"## {icon} AISPA Audit Report\n")
-        md.append(f"**{total}** prompt(s) scanned — **{passed}** passed, **{failed}** failed, **{errors}** error(s)\n")
-        md.append("**Files audited:**")
-        for r in results:
-            md.append(f"- `{r['path']}`")
-        md.append("")
+                        # Write skip report
+                        md = ["## AISPA Audit Report\n",
+                              "**No prompt files were modified in this PR.** Audit skipped.\n",
+                              "---",
+                              "*Audited by [AISPA](https://github.com/XiangningLin/aispa-audit-action) — AI System Prompt Auditing Standard.*"]
+                        with open("/tmp/aispa-report.md", "w") as f:
+                            f.write("\n".join(md))
+                        sys.exit(0)
 
-        for r in results:
-            if r["status"] == "ERROR":
-                md.append(f"### ⚠️ `{r['path']}`\n")
-                md.append(f"> **Error:** {r['error']}\n")
-                continue
+                    print(f"\nPR mode: {len(sources_to_scan)} of {len(sources)} source(s) have changes")
+                else:
+                    print("::warning::Could not determine changed files, falling back to full scan")
 
-            file_icon = "✅" if r["status"] == "PASS" else "❌"
-            md.append(f"### {file_icon} `{r['path']}`\n")
-            md.append(f"**Status:** {r['status']} | **Compliance:** {r['compliance_rate']}% | **Score:** {r['overall_score']}\n")
+            # 3. Extract prompts from sources
+            all_prompts = []
+            for source in sources_to_scan:
+                source_type = source.get("type", "directory")
+                extractor = EXTRACTORS.get(source_type)
+                if not extractor:
+                    print(f"::warning::Unknown source type '{source_type}' for {source['path']}, skipping")
+                    continue
+                extracted = extractor(source)
+                print(f"  Extracted {len(extracted)} prompt(s) from [{source_type}] {source['path']}")
+                all_prompts.extend(extracted)
 
-            # Dimensions table
-            dims = r.get("dimensions", [])
-            if dims:
-                md.append("| Dimension | Score | Explanation |")
-                md.append("|-----------|:-----:|-------------|")
-                for d in dims:
-                    score = d.get("score", 0)
-                    emoji = "✅" if score > 0 else ("❌" if score < 0 else "➖")
-                    dim_id = d.get("id", "")
-                    name = d.get("name", "")
-                    explanation = d.get("explanation", "")
-                    evidence = d.get("evidence", "")
-                    if evidence:
-                        explanation = f'{explanation} *"{evidence}"*'
-                    md.append(f"| {dim_id}: {name} | {emoji} {score:+d} | {explanation} |")
-                md.append("")
+            if not all_prompts:
+                msg = "No prompts found in configured sources."
+                if is_pr:
+                    print(f"\n{msg} Skipping audit.")
+                    with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                        f.write("status=SKIPPED\n")
 
-            # Critical issues
-            issues = r.get("critical_issues", [])
-            if issues:
-                md.append("**⚠️ Critical Issues:**\n")
-                for issue in issues:
-                    md.append(f"- {issue}")
-                md.append("")
+                    md = [f"## AISPA Audit Report\n", f"**{msg}** Audit skipped.\n", "---",
+                          "*Audited by [AISPA](https://github.com/XiangningLin/aispa-audit-action) — AI System Prompt Auditing Standard.*"]
+                    with open("/tmp/aispa-report.md", "w") as f:
+                        f.write("\n".join(md))
+                    sys.exit(0)
+                else:
+                    print(f"::error::{msg}")
+                    with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                        f.write("status=FAILED\n")
+                    sys.exit(1)
 
-            # Recommendations
-            recs = r.get("recommendations", [])
-            if recs:
-                md.append("<details><summary>💡 Recommendations</summary>\n")
-                for rec in recs:
-                    md.append(f"- {rec}")
-                md.append("\n</details>\n")
+            scan_mode = "incremental (PR)" if is_pr else "full"
+            print(f"\nAISPA Audit — {scan_mode} scan")
+            print(f"Found {len(all_prompts)} prompt(s) to audit")
+            print("=" * 60)
 
-        md.append("---")
-        md.append("*Audited by [AISPA](https://github.com/XiangningLin/aispa-audit-action) — AI System Prompt Auditing Standard.*")
+            # 4. Audit each prompt
+            results = []
+            passed = 0
+            failed = 0
+            errors = 0
 
-        report_content = "\n".join(md)
+            for prompt_info in all_prompts:
+                filepath = prompt_info["path"]
+                content = prompt_info["content"]
+                name = prompt_info["name"]
 
-        # Write report to file
-        with open("/tmp/aispa-report.md", "w") as f:
-            f.write(report_content)
+                try:
+                    data = audit_prompt(content)
+                except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                    errors += 1
+                    err_msg = str(e)
+                    results.append({"path": filepath, "name": name, "status": "ERROR", "error": err_msg})
+                    print(f"  [!] {filepath} ({name}) — ERROR ({err_msg})")
+                    continue
 
-        # Write status to GITHUB_OUTPUT
-        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"status={'PASSED' if overall_pass else 'FAILED'}\n")
+                compliance_rate = data.get("compliance_rate", 0)
+                status = data.get("overall_status", "FAIL")
+                if threshold and compliance_rate < threshold:
+                    status = "FAIL"
 
-        sys.exit(0 if overall_pass else 1)
+                if status == "PASS":
+                    passed += 1
+                    print(f"  [v] {filepath} ({name}) — PASS (compliance: {compliance_rate}%, score: {data.get('overall_score', 0)})")
+                else:
+                    failed += 1
+                    print(f"  [x] {filepath} ({name}) — FAIL (compliance: {compliance_rate}%, score: {data.get('overall_score', 0)})")
+                    for issue in data.get("critical_issues", []):
+                        print(f"       - {issue}")
+
+                results.append({
+                    "path": filepath,
+                    "name": name,
+                    "status": status,
+                    "compliance_rate": compliance_rate,
+                    "overall_score": data.get("overall_score", 0),
+                    "dimensions": data.get("dimensions", []),
+                    "critical_issues": data.get("critical_issues", []),
+                    "recommendations": data.get("recommendations", []),
+                })
+
+            total = len(all_prompts)
+            overall_pass = failed == 0 and errors == 0
+
+            print(f"\n{'=' * 60}")
+            print(f"Summary: {total} prompt(s) audited, {passed} passed, {failed} failed, {errors} error(s)")
+            print(f"Scan mode: {scan_mode}")
+            print(f"\n{'PASSED' if overall_pass else 'FAILED'}\n")
+
+            # 5. Generate markdown report
+            icon = "v" if overall_pass else "x"
+            md = []
+            md.append(f"## {'✅' if overall_pass else '❌'} AISPA Audit Report\n")
+            md.append(f"**Scan mode:** {scan_mode}  ")
+            md.append(f"**{total}** prompt(s) audited — **{passed}** passed, **{failed}** failed, **{errors}** error(s)\n")
+            md.append("**Prompts audited:**")
+            for r in results:
+                md.append(f"- `{r['path']}` ({r['name']})")
+            md.append("")
+
+            for r in results:
+                if r["status"] == "ERROR":
+                    md.append(f"### ⚠️ `{r['path']}`\n")
+                    md.append(f"> **Error:** {r['error']}\n")
+                    continue
+
+                file_icon = "✅" if r["status"] == "PASS" else "❌"
+                md.append(f"### {file_icon} `{r['path']}` — {r['name']}\n")
+                md.append(f"**Status:** {r['status']} | **Compliance:** {r['compliance_rate']}% | **Score:** {r['overall_score']}\n")
+
+                dims = r.get("dimensions", [])
+                if dims:
+                    md.append("| Dimension | Score | Explanation |")
+                    md.append("|-----------|:-----:|-------------|")
+                    for d in dims:
+                        score = d.get("score", 0)
+                        emoji = "✅" if score > 0 else ("❌" if score < 0 else "➖")
+                        dim_id = d.get("id", "")
+                        name = d.get("name", "")
+                        explanation = d.get("explanation", "")
+                        evidence = d.get("evidence", "")
+                        if evidence:
+                            explanation = f'{explanation} *"{evidence}"*'
+                        md.append(f"| {dim_id}: {name} | {emoji} {score:+d} | {explanation} |")
+                    md.append("")
+
+                issues = r.get("critical_issues", [])
+                if issues:
+                    md.append("**⚠️ Critical Issues:**\n")
+                    for issue in issues:
+                        md.append(f"- {issue}")
+                    md.append("")
+
+                recs = r.get("recommendations", [])
+                if recs:
+                    md.append("<details><summary>💡 Recommendations</summary>\n")
+                    for rec in recs:
+                        md.append(f"- {rec}")
+                    md.append("\n</details>\n")
+
+            md.append("---")
+            md.append("*Audited by [AISPA](https://github.com/XiangningLin/aispa-audit-action) — AI System Prompt Auditing Standard.*")
+
+            report_content = "\n".join(md)
+            with open("/tmp/aispa-report.md", "w") as f:
+                f.write(report_content)
+
+            # 6. Write status
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write(f"status={'PASSED' if overall_pass else 'FAILED'}\n")
+
+            sys.exit(0 if overall_pass else 1)
+
+        main()
         PYTHON_SCRIPT
 
     - name: Comment on PR
@@ -257,3 +610,10 @@ runs:
               body: body,
             });
           }
+
+    - name: Fail if audit did not pass
+      if: steps.audit.outputs.status == 'FAILED'
+      shell: bash
+      run: |
+        echo "::error::AISPA audit failed. See report above for details."
+        exit 1
