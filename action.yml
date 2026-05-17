@@ -29,10 +29,6 @@ inputs:
     description: "Post audit results as a PR comment (requires pull_request trigger)"
     required: false
     default: "true"
-  version:
-    description: "Version of aispa-audit CLI to install"
-    required: false
-    default: "latest"
 
 outputs:
   status:
@@ -42,16 +38,6 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Install aispa-audit
-      shell: bash
-      run: |
-        python3 -m venv /tmp/aispa-env
-        if [ "${{ inputs.version }}" = "latest" ]; then
-          /tmp/aispa-env/bin/pip install --quiet "aispa-audit @ git+https://github.com/XiangningLin/aispa-audit.git@main"
-        else
-          /tmp/aispa-env/bin/pip install --quiet "aispa-audit==${{ inputs.version }}"
-        fi
-
     - name: Run AISPA audit
       id: audit
       shell: bash
@@ -59,28 +45,172 @@ runs:
         AISPA_API_URL: ${{ inputs.api-url }}
         AISPA_API_KEY: ${{ inputs.api-key }}
         AISPA_MODEL: ${{ inputs.model }}
+        PROMPTS_DIR: ${{ inputs.prompts-dir }}
+        THRESHOLD: ${{ inputs.threshold }}
       run: |
         set +e
 
-        AISPA_CMD="/tmp/aispa-env/bin/python -m aispa_audit.cli"
+        PASSED=0
+        FAILED=0
+        ERRORS=0
+        TOTAL=0
+        REPORT_MD=""
+        TABLE_OUTPUT=""
 
-        # Run with table output for logs
-        $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output table
-        EXIT_CODE=$?
+        # Find all prompt files
+        FILES=$(find "$PROMPTS_DIR" -type f \( -name "*.txt" -o -name "*.md" -o -name "*.prompt" -o -name "*.system" \) | sort)
 
-        # Write markdown report to file (avoids shell/JS injection issues)
-        $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output markdown > /tmp/aispa-report.md 2>&1 || true
-
-        # Write JSON result to file
-        $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output json > /tmp/aispa-result.json 2>&1 || true
-
-        if [ $EXIT_CODE -eq 0 ]; then
-          echo "status=PASSED" >> $GITHUB_OUTPUT
-        else
+        if [ -z "$FILES" ]; then
+          echo "::error::No prompt files found in $PROMPTS_DIR"
           echo "status=FAILED" >> $GITHUB_OUTPUT
+          exit 1
         fi
 
-        exit $EXIT_CODE
+        echo "AISPA Audit - scanning $PROMPTS_DIR"
+        echo "========================================="
+
+        for FILE in $FILES; do
+          TOTAL=$((TOTAL + 1))
+          CONTENT=$(cat "$FILE")
+
+          if [ -z "$CONTENT" ]; then
+            ERRORS=$((ERRORS + 1))
+            echo "[$FILE] ERROR: empty file"
+            continue
+          fi
+
+          # Build JSON payload
+          PAYLOAD=$(python3 -c "
+        import json, sys
+        content = sys.stdin.read()
+        payload = {'prompt': content, 'consent': True}
+        model = '$AISPA_MODEL'
+        if model:
+            payload['model'] = model
+        print(json.dumps(payload))
+        " <<< "$CONTENT")
+
+          # Call AISPA API
+          HEADERS=(-H "Content-Type: application/json")
+          if [ -n "$AISPA_API_KEY" ]; then
+            HEADERS+=(-H "Authorization: Bearer $AISPA_API_KEY")
+          fi
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 120 \
+            "${HEADERS[@]}" \
+            -X POST "$AISPA_API_URL/api/audit" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            ERRORS=$((ERRORS + 1))
+            echo "[$FILE] ERROR: API returned $HTTP_CODE"
+            TABLE_OUTPUT="$TABLE_OUTPUT\n| $FILE | ERROR | - | - | API error ($HTTP_CODE) |"
+            REPORT_MD="$REPORT_MD\n### ⚠️ \`$FILE\`\n> **Error:** API returned HTTP $HTTP_CODE\n"
+            continue
+          fi
+
+          # Parse response
+          RESULT=$(python3 -c "
+        import json, sys
+        data = json.loads(sys.stdin.read())
+        status = data.get('overall_status', 'FAIL')
+        rate = data.get('compliance_rate', 0)
+        score = data.get('overall_score', 0)
+        issues = data.get('critical_issues', [])
+        dims = data.get('dimensions', [])
+
+        threshold = int('$THRESHOLD')
+        if threshold and rate < threshold:
+            status = 'FAIL'
+
+        print(f'{status}|{rate}|{score}')
+        print('---ISSUES---')
+        for i in issues:
+            print(i)
+        print('---DIMS---')
+        for d in dims:
+            sid = d.get('id','')
+            name = d.get('name','')
+            s = d.get('score',0)
+            exp = d.get('explanation','')
+            print(f'{sid}|{name}|{s}|{exp}')
+        " <<< "$BODY")
+
+          STATUS=$(echo "$RESULT" | head -1 | cut -d'|' -f1)
+          RATE=$(echo "$RESULT" | head -1 | cut -d'|' -f2)
+          SCORE=$(echo "$RESULT" | head -1 | cut -d'|' -f3)
+          ISSUES=$(echo "$RESULT" | sed -n '/---ISSUES---/,/---DIMS---/p' | grep -v "^---")
+          DIMS=$(echo "$RESULT" | sed -n '/---DIMS---/,$ p' | grep -v "^---")
+
+          if [ "$STATUS" = "PASS" ]; then
+            PASSED=$((PASSED + 1))
+            echo "✅ [$FILE] PASS (compliance: ${RATE}%, score: $SCORE)"
+          else
+            FAILED=$((FAILED + 1))
+            echo "❌ [$FILE] FAIL (compliance: ${RATE}%, score: $SCORE)"
+            if [ -n "$ISSUES" ]; then
+              echo "$ISSUES" | while read -r issue; do
+                echo "   - $issue"
+              done
+            fi
+          fi
+
+          # Build markdown report
+          if [ "$STATUS" = "PASS" ]; then
+            ICON="✅"
+          else
+            ICON="❌"
+          fi
+          REPORT_MD="$REPORT_MD\n### $ICON \`$FILE\`\n"
+          REPORT_MD="$REPORT_MD\n**Status:** $STATUS | **Compliance:** ${RATE}% | **Score:** $SCORE\n"
+
+          if [ -n "$DIMS" ]; then
+            REPORT_MD="$REPORT_MD\n| Dimension | Score | Explanation |"
+            REPORT_MD="$REPORT_MD\n|-----------|:-----:|-------------|"
+            echo "$DIMS" | while IFS='|' read -r did dname dscore dexp; do
+              if [ "$dscore" -gt 0 ] 2>/dev/null; then
+                demoji="✅"
+              elif [ "$dscore" -lt 0 ] 2>/dev/null; then
+                demoji="❌"
+              else
+                demoji="➖"
+              fi
+              REPORT_MD="$REPORT_MD\n| $did: $dname | $demoji $dscore | $dexp |"
+            done
+            REPORT_MD="$REPORT_MD\n"
+          fi
+
+          if [ -n "$ISSUES" ]; then
+            REPORT_MD="$REPORT_MD\n**Critical Issues:**"
+            echo "$ISSUES" | while read -r issue; do
+              REPORT_MD="$REPORT_MD\n- $issue"
+            done
+            REPORT_MD="$REPORT_MD\n"
+          fi
+        done
+
+        echo ""
+        echo "========================================="
+        echo "Summary: $TOTAL prompt(s) scanned, $PASSED passed, $FAILED failed, $ERRORS error(s)"
+
+        # Write markdown report
+        HEADER="## AISPA Audit Report\n\n**${TOTAL}** prompt(s) scanned — **${PASSED}** passed, **${FAILED}** failed, **${ERRORS}** error(s)\n"
+        echo -e "$HEADER$REPORT_MD\n---\n*Audited by [AISPA](https://systempromptauditingbackend.vercel.app) — AI System Prompt Auditing.*" > /tmp/aispa-report.md
+
+        if [ $FAILED -eq 0 ] && [ $ERRORS -eq 0 ]; then
+          echo "status=PASSED" >> $GITHUB_OUTPUT
+          echo ""
+          echo "✅ PASSED"
+          exit 0
+        else
+          echo "status=FAILED" >> $GITHUB_OUTPUT
+          echo ""
+          echo "❌ FAILED"
+          exit 1
+        fi
 
     - name: Comment on PR
       if: always() && github.event_name == 'pull_request' && inputs.comment-on-pr == 'true'
