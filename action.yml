@@ -343,8 +343,8 @@ runs:
         # ---------------------------------------------------------------------------
         # AISPA API call
         # ---------------------------------------------------------------------------
-        def audit_prompt(content):
-            """Call the AISPA API to audit a single prompt."""
+        def audit_prompt(content, max_retries=3):
+            """Call the AISPA API to audit a single prompt, with retry on failure."""
             payload = {"prompt": content, "consent": True}
             if model:
                 payload["model"] = model
@@ -353,14 +353,25 @@ runs:
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
 
-            req = urllib.request.Request(
-                f"{api_url}/api/audit",
-                data=json.dumps(payload).encode(),
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                return json.loads(resp.read().decode())
+            import time
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    req = urllib.request.Request(
+                        f"{api_url}/api/audit",
+                        data=json.dumps(payload).encode(),
+                        headers=headers,
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        return json.loads(resp.read().decode())
+                except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt * 5
+                        print(f"       Retry {attempt + 1}/{max_retries - 1} after {wait}s (error: {e})")
+                        time.sleep(wait)
+            raise last_error
 
         # ---------------------------------------------------------------------------
         # Main
