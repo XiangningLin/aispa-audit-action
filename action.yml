@@ -153,6 +153,10 @@ runs:
         md = []
         md.append(f"## {icon} AISPA Audit Report\n")
         md.append(f"**{total}** prompt(s) scanned — **{passed}** passed, **{failed}** failed, **{errors}** error(s)\n")
+        md.append("**Files audited:**")
+        for r in results:
+            md.append(f"- `{r['path']}`")
+        md.append("")
 
         for r in results:
             if r["status"] == "ERROR":
