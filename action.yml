@@ -8,7 +8,7 @@ branding:
 
 inputs:
   prompts-dir:
-    description: "Path to the directory containing system prompt files"
+    description: "Comma-separated paths to directories containing system prompt files"
     required: true
     default: "./prompts"
   threshold:
@@ -55,27 +55,30 @@ runs:
         api_url = os.environ.get("AISPA_API_URL", "https://systempromptauditingbackend.vercel.app")
         api_key = os.environ.get("AISPA_API_KEY", "")
         model = os.environ.get("AISPA_MODEL", "")
-        prompts_dir = os.environ.get("PROMPTS_DIR", "./prompts")
+        prompts_dirs = os.environ.get("PROMPTS_DIR", "./prompts")
         threshold = int(os.environ.get("THRESHOLD", "0"))
 
         EXTENSIONS = {".txt", ".md", ".prompt", ".system"}
 
-        # Discover prompt files
-        root = Path(prompts_dir)
-        if not root.is_dir():
-            print(f"::error::Directory not found: {prompts_dir}")
-            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                f.write("status=FAILED\n")
-            sys.exit(1)
+        # Discover prompt files from all directories (comma-separated)
+        dirs = [d.strip() for d in prompts_dirs.split(",") if d.strip()]
+        files = []
+        for d in dirs:
+            root = Path(d)
+            if not root.is_dir():
+                print(f"::warning::Directory not found: {d}, skipping")
+                continue
+            found = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTENSIONS)
+            files.extend(found)
 
-        files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTENSIONS)
         if not files:
-            print(f"::error::No prompt files found in {prompts_dir}")
+            print(f"::error::No prompt files found in: {prompts_dirs}")
             with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                 f.write("status=FAILED\n")
             sys.exit(1)
 
-        print(f"\nAISPA Audit — scanning {prompts_dir}")
+        print(f"\nAISPA Audit — scanning: {', '.join(dirs)}")
+        print(f"Found {len(files)} prompt file(s)")
         print("=" * 60)
 
         results = []
