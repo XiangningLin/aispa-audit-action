@@ -42,20 +42,15 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-
     - name: Install aispa-audit
       shell: bash
       run: |
+        python3 -m venv /tmp/aispa-env
         if [ "${{ inputs.version }}" = "latest" ]; then
-          pip install "aispa-audit @ git+https://github.com/XiangningLin/aispa-audit.git@main"
+          /tmp/aispa-env/bin/pip install --quiet "aispa-audit @ git+https://github.com/XiangningLin/aispa-audit.git@main"
         else
-          pip install "aispa-audit==${{ inputs.version }}"
+          /tmp/aispa-env/bin/pip install --quiet "aispa-audit==${{ inputs.version }}"
         fi
-        echo "$(python -m site --user-base)/bin" >> $GITHUB_PATH
 
     - name: Run AISPA audit
       id: audit
@@ -67,7 +62,7 @@ runs:
       run: |
         set +e
 
-        AISPA_CMD="python -m aispa_audit.cli"
+        AISPA_CMD="/tmp/aispa-env/bin/python -m aispa_audit.cli"
 
         # Run with table output for logs
         $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output table
