@@ -175,15 +175,10 @@ runs:
                     dim_id = d.get("id", "")
                     name = d.get("name", "")
                     explanation = d.get("explanation", "")
+                    evidence = d.get("evidence", "")
+                    if evidence:
+                        explanation = f'{explanation} *"{evidence}"*'
                     md.append(f"| {dim_id}: {name} | {emoji} {score:+d} | {explanation} |")
-                md.append("")
-
-            # Evidence (malicious spans)
-            violations = [d for d in dims if d.get("score", 0) < 0 and d.get("evidence")]
-            if violations:
-                md.append("**🔍 Violation Evidence (Malicious Spans):**\n")
-                for d in violations:
-                    md.append(f"- **{d['id']} ({d['name']}):** `{d['evidence']}`")
                 md.append("")
 
             # Critical issues
