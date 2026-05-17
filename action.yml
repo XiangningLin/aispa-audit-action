@@ -18,7 +18,7 @@ inputs:
   api-url:
     description: "Base URL of the AISPA auditing service"
     required: false
-    default: "https://prompt-auditing-service.vercel.app"
+    default: "https://systempromptauditingbackend.vercel.app"
   api-key:
     description: "API key for the AISPA service"
     required: false
