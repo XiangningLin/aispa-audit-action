@@ -611,6 +611,14 @@ runs:
             });
           }
 
+    - name: Upload audit report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: aispa-audit-report
+        path: /tmp/aispa-report.md
+        if-no-files-found: ignore
+
     - name: Fail if audit did not pass
       if: steps.audit.outputs.status == 'FAILED'
       shell: bash
