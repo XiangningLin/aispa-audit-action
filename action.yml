@@ -53,6 +53,7 @@ runs:
         AISPA_PROMPTS_DIR: ${{ inputs.prompts-dir }}
         THRESHOLD: ${{ inputs.threshold }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
+        PYTHONUNBUFFERED: "1"
       run: |
         python3 << 'PYTHON_SCRIPT'
         import os, json, sys, re, ast, glob, subprocess, urllib.request, urllib.error
