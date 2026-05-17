@@ -55,6 +55,7 @@ runs:
         else
           pip install "aispa-audit==${{ inputs.version }}"
         fi
+        echo "$(python -m site --user-base)/bin" >> $GITHUB_PATH
 
     - name: Run AISPA audit
       id: audit
@@ -66,15 +67,17 @@ runs:
       run: |
         set +e
 
+        AISPA_CMD="python -m aispa_audit.cli"
+
         # Run with table output for logs
-        aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output table
+        $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output table
         EXIT_CODE=$?
 
         # Write markdown report to file (avoids shell/JS injection issues)
-        aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output markdown > /tmp/aispa-report.md 2>&1 || true
+        $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output markdown > /tmp/aispa-report.md 2>&1 || true
 
         # Write JSON result to file
-        aispa-audit ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output json > /tmp/aispa-result.json 2>&1 || true
+        $AISPA_CMD ${{ inputs.prompts-dir }} --threshold ${{ inputs.threshold }} --output json > /tmp/aispa-result.json 2>&1 || true
 
         if [ $EXIT_CODE -eq 0 ]; then
           echo "status=PASSED" >> $GITHUB_OUTPUT
