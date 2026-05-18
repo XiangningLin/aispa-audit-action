@@ -53,6 +53,11 @@ runs:
         AISPA_PROMPTS_DIR: ${{ inputs.prompts-dir }}
         THRESHOLD: ${{ inputs.threshold }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_REPO: ${{ github.repository }}
+        GITHUB_BRANCH: ${{ github.head_ref || github.ref_name }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_ACTOR: ${{ github.actor }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
         PYTHONUNBUFFERED: "1"
       run: |
         python3 << 'PYTHON_SCRIPT'
@@ -69,6 +74,14 @@ runs:
         prompts_dir = os.environ.get("AISPA_PROMPTS_DIR", "")
         threshold = int(os.environ.get("THRESHOLD", "0"))
         event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        github_context = {
+            "repo": os.environ.get("GITHUB_REPO", ""),
+            "branch": os.environ.get("GITHUB_BRANCH", ""),
+            "commit_sha": os.environ.get("GITHUB_SHA", ""),
+            "actor": os.environ.get("GITHUB_ACTOR", ""),
+            "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+            "event_type": event_name,
+        }
 
         PROMPT_FILE_EXTENSIONS = {".txt", ".md", ".prompt", ".system"}
 
@@ -341,13 +354,58 @@ runs:
             return False
 
         # ---------------------------------------------------------------------------
-        # AISPA API call
+        # AISPA API calls
         # ---------------------------------------------------------------------------
-        def audit_prompt(content, max_retries=3):
+        def api_call(endpoint, payload, method="POST", timeout=120):
+            """Generic API call helper."""
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            req = urllib.request.Request(
+                f"{api_url}{endpoint}",
+                data=json.dumps(payload).encode() if payload else None,
+                headers=headers,
+                method=method,
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+
+        def create_run(scan_mode):
+            """Create a new audit run on the backend. Returns run_uuid or None."""
+            try:
+                payload = {**github_context, "scan_mode": scan_mode}
+                result = api_call("/api/runs", payload, timeout=15)
+                return result.get("run_uuid")
+            except Exception as e:
+                print(f"::warning::Could not create audit run: {e}")
+                return None
+
+        def complete_run(run_uuid, total, passed, failed, errors, overall_status):
+            """Mark a run as complete with summary stats."""
+            try:
+                api_call(f"/api/runs/{run_uuid}/complete", {
+                    "total_prompts": total,
+                    "passed": passed,
+                    "failed": failed,
+                    "errors": errors,
+                    "overall_status": overall_status,
+                }, timeout=15)
+            except Exception as e:
+                print(f"::warning::Could not complete audit run: {e}")
+
+        def audit_prompt(content, prompt_path="", prompt_name="", run_uuid=None, max_retries=3):
             """Call the AISPA API to audit a single prompt, with retry on failure."""
-            payload = {"prompt": content, "consent": True}
+            payload = {
+                "prompt": content,
+                "consent": True,
+                "prompt_path": prompt_path,
+                "prompt_name": prompt_name,
+                **github_context,
+            }
             if model:
                 payload["model"] = model
+            if run_uuid:
+                payload["run_uuid"] = run_uuid
 
             headers = {"Content-Type": "application/json"}
             if api_key:
@@ -460,12 +518,17 @@ runs:
                         f.write("status=FAILED\n")
                     sys.exit(1)
 
-            scan_mode = "incremental (PR)" if is_pr else "full"
+            scan_mode = "incremental" if is_pr else "full"
             print(f"\nAISPA Audit — {scan_mode} scan")
             print(f"Found {len(all_prompts)} prompt(s) to audit")
             print("=" * 60)
 
-            # 4. Audit each prompt
+            # 4. Create audit run on backend
+            run_uuid = create_run(scan_mode)
+            if run_uuid:
+                print(f"Audit run created: {run_uuid}")
+
+            # 5. Audit each prompt
             results = []
             passed = 0
             failed = 0
@@ -477,7 +540,7 @@ runs:
                 name = prompt_info["name"]
 
                 try:
-                    data = audit_prompt(content)
+                    data = audit_prompt(content, prompt_path=filepath, prompt_name=name, run_uuid=run_uuid)
                 except (urllib.error.URLError, urllib.error.HTTPError) as e:
                     errors += 1
                     err_msg = str(e)
@@ -512,13 +575,19 @@ runs:
 
             total = len(all_prompts)
             overall_pass = failed == 0 and errors == 0
+            overall_status = "PASSED" if overall_pass else "FAILED"
+
+            # 6. Complete audit run on backend
+            if run_uuid:
+                complete_run(run_uuid, total, passed, failed, errors, overall_status)
+                print(f"Audit run completed: {run_uuid}")
 
             print(f"\n{'=' * 60}")
             print(f"Summary: {total} prompt(s) audited, {passed} passed, {failed} failed, {errors} error(s)")
             print(f"Scan mode: {scan_mode}")
-            print(f"\n{'PASSED' if overall_pass else 'FAILED'}\n")
+            print(f"\n{overall_status}\n")
 
-            # 5. Generate markdown report
+            # 7. Generate markdown report
             icon = "v" if overall_pass else "x"
             md = []
             md.append(f"## {'✅' if overall_pass else '❌'} AISPA Audit Report\n")
